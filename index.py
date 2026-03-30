@@ -1,7 +1,7 @@
 """
 Polymarket Copy-Trade Bot
 """
-
+ 
 import asyncio
 import aiohttp
 import json
@@ -13,14 +13,14 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from statistics import mean
-
+ 
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from py_clob_client.constants import POLYGON
-
+ 
 load_dotenv()
-
+ 
 TARGET_WALLETS = [
     {
         "address":  "0xd8f8c13644ea84d62e1ec88c5d1215e436eb0f11",
@@ -28,15 +28,15 @@ TARGET_WALLETS = [
         "copy_pct": 0.2,
     },
 ]
-
+ 
 PRIVATE_KEY     = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS  = os.getenv("FUNDER_ADDRESS")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-
+ 
 HOST    = "https://clob.polymarket.com"
 WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID = POLYGON
-
+ 
 COPY_PERCENT       = 0.2
 MAX_WALLET_PERCENT = 0.30
 MAX_MARKET_PERCENT = 0.15
@@ -44,55 +44,59 @@ MIN_TRADE_SIZE     = 0.20
 SLIPPAGE_TOLERANCE = 0.05
 MAX_SPREAD         = 0.12
 STOP_LOSS_PCT      = 0.25
-
+ 
 CONVICTION_MULTIPLIER = 0
 CONVICTION_LOOKBACK   = 20
-
+ 
 DYNAMIC_TARGETS      = True
 DYNAMIC_TARGET_COUNT = 10
 DYNAMIC_ROTATE_EVERY = 30
-
+ 
 POLL_INTERVAL      = 10
 MAX_SEEN_IDS       = 1000
 BALANCE_TTL        = 30
 WS_PING_INTERVAL   = 10
 STOP_LOSS_INTERVAL = 60
 DRY_RUN            = False
-
+ 
 DB_PATH = "bot_state.db"
-
+ 
 _executor = ThreadPoolExecutor(max_workers=4)
-
+ 
 async def run_blocking(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(_executor, fn, *args)
-
+ 
 client = ClobClient(
     host=HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
     signature_type=1, funder=FUNDER_ADDRESS,
 )
 credentials = client.create_or_derive_api_creds()
 client.set_api_creds(credentials)
-
+ 
 def _get_usdc_balance(self) -> float:
     params = BalanceAllowanceParams(signature_type=1, asset_type=AssetType.COLLATERAL)
     d = self.get_balance_allowance(params=params)
     return int(d["balance"]) / 10**6
-
+ 
 ClobClient.get_usdc_balance = _get_usdc_balance
-
-
+ 
+ 
 def init_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.execute("PRAGMA journal_mode=WAL")
-
+ 
     # Migration: safely add entry_price if missing from an older DB
-    try:
-        con.execute("ALTER TABLE positions ADD COLUMN entry_price REAL NOT NULL DEFAULT 0")
-        con.commit()
-        print("[DB] Migrated: added entry_price column.")
-    except Exception:
-        pass  # column already exists
-
+    for col, definition in [
+        ("entry_price", "REAL NOT NULL DEFAULT 0"),
+        ("peak_price",  "REAL NOT NULL DEFAULT 0"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE positions ADD COLUMN {col} {definition}")
+            con.commit()
+            print(f"[DB] Migrated: added {col} column.")
+        except Exception:
+            pass  # already exists
+ 
     con.execute("""
         CREATE TABLE IF NOT EXISTS seen_trades (
             address  TEXT NOT NULL,
@@ -122,6 +126,7 @@ def init_db() -> sqlite3.Connection:
             token_id    TEXT PRIMARY KEY,
             shares      REAL NOT NULL DEFAULT 0,
             entry_price REAL NOT NULL DEFAULT 0,
+            peak_price  REAL NOT NULL DEFAULT 0,
             updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
         )
     """)
@@ -136,19 +141,19 @@ def init_db() -> sqlite3.Connection:
     """)
     con.commit()
     return con
-
+ 
 db = init_db()
 _db_lock = asyncio.Lock()
-
-
+ 
+ 
 async def is_seen(address: str, trade_id: str) -> bool:
     async with _db_lock:
         return db.execute(
             "SELECT 1 FROM seen_trades WHERE address=? AND trade_id=?",
             (address, trade_id)
         ).fetchone() is not None
-
-
+ 
+ 
 async def mark_seen(address: str, trade_id: str) -> None:
     async with _db_lock:
         db.execute("INSERT OR IGNORE INTO seen_trades VALUES (?,?,strftime('%s','now'))",
@@ -157,8 +162,8 @@ async def mark_seen(address: str, trade_id: str) -> None:
             SELECT trade_id FROM seen_trades WHERE address=? ORDER BY ts DESC LIMIT ?
         )""", (address, address, MAX_SEEN_IDS))
         db.commit()
-
-
+ 
+ 
 async def log_trade(
     target_addr, target_label, token_id, market_q,
     side, our_size, price, executed, reason,
@@ -182,52 +187,89 @@ async def log_trade(
                     total_skipped=total_skipped+1, label=excluded.label,
                     last_seen=strftime('%s','now')""", (target_addr, target_label))
         db.commit()
-
-
+ 
+ 
 async def record_position(token_id: str, shares_delta: float, price: float) -> None:
     async with _db_lock:
-        row = db.execute("SELECT shares FROM positions WHERE token_id=?", (token_id,)).fetchone()
-        current = row[0] if row else 0.0
-        new_shares = max(0.0, round(current + shares_delta, 6))
-        db.execute("""INSERT INTO positions (token_id, shares, entry_price, updated_at)
-            VALUES (?,?,?,strftime('%s','now'))
+        row = db.execute(
+            "SELECT shares, entry_price, peak_price FROM positions WHERE token_id=?",
+            (token_id,)
+        ).fetchone()
+        current_shares = row[0] if row else 0.0
+        current_entry  = row[1] if row else 0.0
+        current_peak   = row[2] if row else 0.0
+ 
+        new_shares = max(0.0, round(current_shares + shares_delta, 6))
+        new_entry  = current_entry if current_entry > 0 else price
+        new_peak   = max(current_peak, price)
+ 
+        db.execute("""INSERT INTO positions (token_id, shares, entry_price, peak_price, updated_at)
+            VALUES (?,?,?,?,strftime('%s','now'))
             ON CONFLICT(token_id) DO UPDATE SET
                 shares=excluded.shares,
-                entry_price=CASE WHEN excluded.shares>0 THEN excluded.entry_price ELSE entry_price END,
+                entry_price=CASE WHEN entry_price > 0 THEN entry_price ELSE excluded.entry_price END,
+                peak_price=MAX(peak_price, excluded.peak_price),
                 updated_at=excluded.updated_at""",
-            (token_id, new_shares, price))
+            (token_id, new_shares, new_entry, new_peak))
         db.commit()
-
-
+ 
+ 
 def get_all_positions() -> list[dict]:
     rows = db.execute(
-        "SELECT token_id, shares, entry_price FROM positions WHERE shares > 0.001"
+        "SELECT token_id, shares, entry_price, peak_price FROM positions WHERE shares > 0.001"
     ).fetchall()
-    return [{"token_id": r[0], "shares": r[1], "entry_price": r[2]} for r in rows]
-
-
+    return [{"token_id": r[0], "shares": r[1], "entry_price": r[2], "peak_price": r[3]} for r in rows]
+ 
+ 
 def get_held_token_ids() -> set[str]:
     """Return set of all token_ids we currently hold a position in."""
     rows = db.execute(
         "SELECT token_id FROM positions WHERE shares > 0.001"
     ).fetchall()
     return {r[0] for r in rows}
-
-
+ 
+ 
+async def update_peak_price(token_id: str, current_price: float) -> None:
+    """Update peak_price if current price is a new high for this position."""
+    async with _db_lock:
+        db.execute("""
+            UPDATE positions SET
+                peak_price = MAX(peak_price, ?),
+                updated_at = strftime('%s','now')
+            WHERE token_id = ? AND shares > 0.001
+        """, (current_price, token_id))
+        db.commit()
+ 
+ 
+def get_market_invested(token_ids: list[str]) -> float:
+    """
+    Return total USD currently invested across all tokens of a market.
+    Uses shares * entry_price as a conservative estimate of cost basis.
+    """
+    if not token_ids:
+        return 0.0
+    placeholders = ",".join("?" * len(token_ids))
+    rows = db.execute(
+        f"SELECT shares, entry_price FROM positions WHERE token_id IN ({placeholders}) AND shares > 0.001",
+        token_ids
+    ).fetchall()
+    return sum(r[0] * r[1] for r in rows)
+ 
+ 
 def get_target_stats() -> list[dict]:
     rows = db.execute(
         "SELECT address, label, total_copied, total_skipped FROM target_stats"
     ).fetchall()
     return [{"address": r[0], "label": r[1], "copied": r[2], "skipped": r[3]} for r in rows]
-
-
+ 
+ 
 # ── Live order book ────────────────────────────────────────────────────────────
-
+ 
 _live_books: dict[str, dict] = {}
 _subscribed_tokens: set[str] = set()
 _ws_send_queue: asyncio.Queue | None = None
-
-
+ 
+ 
 def _parse_book_event(msg: dict) -> None:
     token_id = msg.get("asset_id")
     if not token_id:
@@ -245,24 +287,24 @@ def _parse_book_event(msg: dict) -> None:
                 side_dict.pop(p, None)
             else:
                 side_dict[p] = s
-
-
+ 
+ 
 def get_live_best_ask(token_id: str) -> float | None:
     b = _live_books.get(token_id)
     return min(b["asks"]) if b and b["asks"] else None
-
+ 
 def get_live_best_bid(token_id: str) -> float | None:
     b = _live_books.get(token_id)
     return max(b["bids"]) if b and b["bids"] else None
-
+ 
 def get_live_spread(token_id: str) -> float | None:
     ask = get_live_best_ask(token_id)
     bid = get_live_best_bid(token_id)
     if ask is not None and bid is not None:
         return round(ask - bid, 6)
     return None
-
-
+ 
+ 
 async def subscribe_token(token_id: str) -> None:
     if token_id in _subscribed_tokens:
         return
@@ -270,15 +312,15 @@ async def subscribe_token(token_id: str) -> None:
     if _ws_send_queue:
         await _ws_send_queue.put(json.dumps({"assets_ids": [token_id], "operation": "subscribe"}))
     print(f"[WS] Subscribed {token_id[:16]}…")
-
-
+ 
+ 
 async def ws_book_listener() -> None:
     global _ws_send_queue
     _ws_send_queue = asyncio.Queue()
     print("[WS] Waiting for first token before connecting…")
     while not _subscribed_tokens:
         await asyncio.sleep(1)
-
+ 
     while True:
         try:
             async with websockets.connect(WSS_URL, ping_interval=None) as ws:
@@ -301,25 +343,25 @@ async def ws_book_listener() -> None:
         except Exception as exc:
             print(f"[WS] Disconnected: {exc} — reconnecting in 5s…")
             await asyncio.sleep(5)
-
-
+ 
+ 
 async def _ws_sender(ws) -> None:
     while True:
         msg = await _ws_send_queue.get()
         await ws.send(msg)
-
+ 
 async def _ws_pinger(ws) -> None:
     while True:
         await asyncio.sleep(WS_PING_INTERVAL)
         await ws.send("PING")
-
-
+ 
+ 
 # ── Dynamic targets ────────────────────────────────────────────────────────────
-
+ 
 _dynamic_targets: list[dict] = []
 _dynamic_cycle_count: int = 0
-
-
+ 
+ 
 async def fetch_leaderboard_targets(session: aiohttp.ClientSession) -> list[dict]:
     try:
         async with session.get(
@@ -330,7 +372,7 @@ async def fetch_leaderboard_targets(session: aiohttp.ClientSession) -> list[dict
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-
+ 
         targets = []
         for entry in data:
             addr = entry.get("address") or entry.get("proxyWallet")
@@ -347,18 +389,18 @@ async def fetch_leaderboard_targets(session: aiohttp.ClientSession) -> list[dict
             })
             if len(targets) >= DYNAMIC_TARGET_COUNT:
                 break
-
+ 
         if targets:
             print(f"[Targets] Loaded {len(targets)} from leaderboard.")
             return targets
-
+ 
     except Exception as exc:
         print(f"[Targets] Leaderboard fetch failed: {exc}")
-
+ 
     print("[Targets] Falling back to static TARGET_WALLETS.")
     return TARGET_WALLETS
-
-
+ 
+ 
 async def get_active_targets(session: aiohttp.ClientSession) -> list[dict]:
     global _dynamic_targets, _dynamic_cycle_count
     if not DYNAMIC_TARGETS:
@@ -367,20 +409,20 @@ async def get_active_targets(session: aiohttp.ClientSession) -> list[dict]:
     if not _dynamic_targets or _dynamic_cycle_count % DYNAMIC_ROTATE_EVERY == 0:
         _dynamic_targets = await fetch_leaderboard_targets(session)
     return _dynamic_targets
-
-
+ 
+ 
 # ── Conviction filter ──────────────────────────────────────────────────────────
-
+ 
 _trade_size_history: dict[str, list[float]] = defaultdict(list)
-
-
+ 
+ 
 def record_trade_size(address: str, size_usd: float) -> None:
     history = _trade_size_history[address]
     history.append(size_usd)
     if len(history) > CONVICTION_LOOKBACK:
         history.pop(0)
-
-
+ 
+ 
 def is_high_conviction(address: str, size_usd: float) -> tuple[bool, str]:
     if CONVICTION_MULTIPLIER <= 0:
         return True, "conviction filter disabled"
@@ -392,25 +434,25 @@ def is_high_conviction(address: str, size_usd: float) -> tuple[bool, str]:
     if size_usd >= threshold:
         return True, f"${size_usd:.2f} >= {CONVICTION_MULTIPLIER}x avg ${avg:.2f} high conviction"
     return False, f"${size_usd:.2f} < {CONVICTION_MULTIPLIER}x avg ${avg:.2f} — low conviction"
-
-
+ 
+ 
 # ── Balance & sizing ───────────────────────────────────────────────────────────
-
+ 
 _cached_balance: float = 0.0
 _balance_fetched_at: float = 0.0
 _cycle_exposure: dict[str, float] = {}
-
-
+ 
+ 
 def reset_cycle_exposure() -> None:
     _cycle_exposure.clear()
-
+ 
 def get_cycle_exposure(token_id: str) -> float:
     return _cycle_exposure.get(token_id, 0.0)
-
+ 
 def add_cycle_exposure(token_id: str, usd: float) -> None:
     _cycle_exposure[token_id] = _cycle_exposure.get(token_id, 0.0) + usd
-
-
+ 
+ 
 async def get_my_balance() -> float:
     global _cached_balance, _balance_fetched_at
     if DRY_RUN:
@@ -424,30 +466,39 @@ async def get_my_balance() -> float:
     except Exception as exc:
         print(f"[Balance] Fetch failed: {exc}")
     return _cached_balance
-
-
+ 
+ 
 async def compute_trade_size(
     token_id: str, shares_traded: float, price: float, copy_pct: float,
+    all_market_tokens: list[str] = None,
 ) -> tuple[float, str]:
     target_usd  = round(shares_traded * price, 2)
     my_balance  = await get_my_balance()
-
+ 
     if my_balance <= 0:
         return 0.0, "wallet balance $0 — check credentials"
-
+ 
     copied_size = round(target_usd * copy_pct, 2)
     wallet_cap  = round(my_balance * MAX_WALLET_PERCENT, 2)
-    already     = get_cycle_exposure(token_id)
-    market_cap  = round(my_balance * MAX_MARKET_PERCENT, 2)
-    mkt_remain  = max(0.0, market_cap - already)
-    final       = round(min(copied_size, wallet_cap, mkt_remain), 2)
-
+ 
+    # Persistent market cap: sum of already-invested + current cycle exposure
+    already_invested = get_market_invested(all_market_tokens or [token_id])
+    cycle_exposure   = get_cycle_exposure(token_id)
+    total_in_market  = already_invested + cycle_exposure
+    market_cap       = round(my_balance * MAX_MARKET_PERCENT, 2)
+    mkt_remain       = max(0.0, market_cap - total_in_market)
+ 
+    final = round(min(copied_size, wallet_cap, mkt_remain), 2)
+ 
     caps = []
     if copied_size > wallet_cap:
         caps.append(f"wallet cap ${wallet_cap:.2f}")
     if copied_size > mkt_remain:
-        caps.append(f"market cap ${mkt_remain:.2f}")
-
+        caps.append(
+            f"market cap ${market_cap:.2f} "
+            f"(${already_invested:.2f} invested + ${cycle_exposure:.2f} this cycle)"
+        )
+ 
     note = (
         f"Target {shares_traded}sh x ${price:.4f} = ${target_usd:.2f} "
         f"x {copy_pct*100:.0f}% = ${copied_size:.2f}"
@@ -455,28 +506,28 @@ async def compute_trade_size(
         + f" = **${final:.2f}**"
     )
     return final, note
-
-
+ 
+ 
 # ── REST helpers ───────────────────────────────────────────────────────────────
-
+ 
 _market_cache: dict[str, dict] = {}
 _market_cache_ttl: dict[str, float] = {}
 MARKET_CACHE_TTL = 300
-
-
+ 
+ 
 async def fetch_json(session: aiohttp.ClientSession, url: str, params: dict = None) -> any:
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
         r.raise_for_status()
         return await r.json()
-
-
+ 
+ 
 async def get_activity(session: aiohttp.ClientSession, address: str, limit: int = 20) -> list[dict]:
     return await fetch_json(
         session, "https://data-api.polymarket.com/activity",
         {"limit": limit, "user": address, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
     )
-
-
+ 
+ 
 async def get_market(session: aiohttp.ClientSession, token_id: str) -> dict:
     now = time.monotonic()
     if token_id in _market_cache and now - _market_cache_ttl.get(token_id, 0) < MARKET_CACHE_TTL:
@@ -488,8 +539,8 @@ async def get_market(session: aiohttp.ClientSession, token_id: str) -> dict:
         _market_cache[token_id] = market
         _market_cache_ttl[token_id] = now
     return market
-
-
+ 
+ 
 async def get_my_positions(session: aiohttp.ClientSession) -> dict[str, float]:
     if not FUNDER_ADDRESS:
         print("[Positions] FUNDER_ADDRESS not set — skipping.")
@@ -501,8 +552,8 @@ async def get_my_positions(session: aiohttp.ClientSession) -> dict[str, float]:
     except Exception as exc:
         print(f"[Positions] Fetch failed: {exc}")
         return {}
-
-
+ 
+ 
 def get_market_url(market: dict) -> str:
     events = market.get("events", [])
     if events:
@@ -514,39 +565,37 @@ def get_market_url(market: dict) -> str:
         return f"https://polymarket.com/event/{slug}"
     cid = market.get("conditionId", "")
     return f"https://polymarket.com/event/{cid}" if cid else "https://polymarket.com"
-
-
+ 
+ 
 def _trade_fingerprint(act: dict) -> str:
     return f"{act.get('asset')}_{act.get('timestamp')}_{act.get('side')}_{act.get('size')}"
-
-
+ 
+ 
 def _rest_best_ask(token_id: str) -> float | None:
     try:
         book = client.get_order_book(token_id)
         return float(min(a.price for a in book.asks)) if book.asks else None
     except Exception:
         return None
-
+ 
 def _rest_best_bid(token_id: str) -> float | None:
     try:
         book = client.get_order_book(token_id)
         return float(max(b.price for b in book.bids)) if book.bids else None
     except Exception:
         return None
-
-
+ 
+ 
 def _safe_shares(usd: float, price: float) -> float:
-    """
-    Compute shares = usd / price rounded DOWN to 1 decimal place.
-    Polymarket maker orders support max 2dp but 1dp is safest to avoid rejections.
-    Uses integer truncation (not round()) to avoid floating point issues.
-    """
-    print(int(usd / price * 10) / 10)
-    return int(usd / price * 10) / 10
-
-
+    """Returns whole-number shares, minimum order value $1."""
+    shares = max(1, int(usd / price))
+    while shares * price < 1.0:
+        shares += 1
+    return float(shares)
+ 
+ 
 # ── Discord ────────────────────────────────────────────────────────────────────
-
+ 
 async def send_discord(
     session: aiohttp.ClientSession, message: str,
     color: int = 0x00b0f4, title: str = "Polymarket Copy Trade",
@@ -562,8 +611,8 @@ async def send_discord(
             r.raise_for_status()
     except Exception as exc:
         print(f"[Discord] Send failed: {exc}")
-
-
+ 
+ 
 async def discord_trade_alert(
     session, act, label, address, question, market_url,
     our_size, sizing_note, executed, conviction_note="", reason="",
@@ -573,17 +622,17 @@ async def discord_trade_alert(
     outcome = act.get("outcome", "?")
     asset   = act.get("asset", "?")
     color   = 0x57F287 if side == "BUY" else 0xED4245
-
+ 
     spread = get_live_spread(asset)
     spread_str = f"{spread:.4f}" if spread is not None else "unknown"
-
+ 
     if DRY_RUN:
         status = f"Dry run — would place ${our_size:.2f} FAK order"
     elif executed:
         status = f"Copied — placed ${our_size:.2f} FAK order"
     else:
         status = f"Skipped — {reason}"
-
+ 
     msg = (
         f"**Trader:** {label} (`{address[:8]}...{address[-6:]}`)\n"
         f"**Market:** [{question}]({market_url})\n"
@@ -595,13 +644,13 @@ async def discord_trade_alert(
     )
     await send_discord(session, msg, color=color,
                        title=f"{'BUY' if side == 'BUY' else 'SELL'} — {label}")
-
-
+ 
+ 
 async def discord_error(session, context: str, exc: Exception) -> None:
     await send_discord(session, f"**Context:** {context}\n```{exc}```",
                        color=0xFEE75C, title="Error")
-
-
+ 
+ 
 async def discord_stop_loss(session, token_id, question, shares, entry, current, pnl_pct) -> None:
     msg = (
         f"**Token:** `{token_id[:16]}...`\n"
@@ -610,8 +659,8 @@ async def discord_stop_loss(session, token_id, question, shares, entry, current,
         f"**PNL:** {pnl_pct*100:.1f}%  — stop-loss at -{STOP_LOSS_PCT*100:.0f}%"
     )
     await send_discord(session, msg, color=0xFF6B35, title="Stop-Loss Triggered")
-
-
+ 
+ 
 async def discord_stats(session, targets) -> None:
     stats = get_target_stats()
     if not stats:
@@ -622,8 +671,8 @@ async def discord_stats(session, targets) -> None:
         hit   = f"{s['copied']/total*100:.0f}%" if total else "—"
         lines.append(f"• **{s['label']}** — {s['copied']} copied, {s['skipped']} skipped ({hit})")
     await send_discord(session, "\n".join(lines), color=0x5865F2, title="Stats")
-
-
+ 
+ 
 # ── Auto-redeem ───────────────────────────────────────────────────────────────
 #
 # Polymarket positions are held in a Safe (proxy multisig). The official SDK
@@ -638,9 +687,9 @@ CTF_ADDRESS          = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS         = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 SAFE_ADDRESS         = FUNDER_ADDRESS   # your proxy wallet = the Safe
 HASH_ZERO            = "0x" + "00" * 32
-
+ 
 REDEEM_INTERVAL = 120   # check for redeemable positions every 2 minutes
-
+ 
 # ABI fragments — only what we need
 CTF_ABI = [
     {
@@ -656,7 +705,7 @@ CTF_ABI = [
         "stateMutability": "nonpayable",
     }
 ]
-
+ 
 SAFE_ABI = [
     {
         "name": "execTransaction",
@@ -702,8 +751,8 @@ SAFE_ABI = [
         "stateMutability": "view",
     },
 ]
-
-
+ 
+ 
 def _build_web3():
     """Build a web3 instance. Returns None if web3 not installed."""
     try:
@@ -714,8 +763,8 @@ def _build_web3():
     except ImportError:
         print("[Redeem] web3 not installed — run: pip install web3")
         return None, None
-
-
+ 
+ 
 def _redeem_position_sync(condition_id: str) -> bool:
     """
     Calls redeemPositions on the CTF contract through the Safe.
@@ -723,15 +772,15 @@ def _redeem_position_sync(condition_id: str) -> bool:
     Returns True on success.
     """
     from web3 import Web3
-
+ 
     w3, account = _build_web3()
     if not w3 or not account:
         return False
-
+ 
     try:
         ctf  = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
         safe = w3.eth.contract(address=Web3.to_checksum_address(SAFE_ADDRESS), abi=SAFE_ABI)
-
+ 
         # Encode the redeemPositions call
         cid_bytes = bytes.fromhex(condition_id.replace("0x", ""))
         data = ctf.encodeABI(
@@ -743,9 +792,9 @@ def _redeem_position_sync(condition_id: str) -> bool:
                 [1, 2],  # index sets for YES and NO
             ]
         )
-
+ 
         nonce = safe.functions.nonce().call()
-
+ 
         # Build Safe transaction hash
         tx_hash = safe.functions.getTransactionHash(
             Web3.to_checksum_address(CTF_ADDRESS),  # to
@@ -757,7 +806,7 @@ def _redeem_position_sync(condition_id: str) -> bool:
             "0x0000000000000000000000000000000000000000",  # refundReceiver
             nonce,
         ).call()
-
+ 
         # Sign the Safe tx hash
         signed = account.signHash(tx_hash)
         # Pack r, s, v into 65-byte signature
@@ -766,7 +815,7 @@ def _redeem_position_sync(condition_id: str) -> bool:
             signed.s.to_bytes(32, "big") +
             bytes([signed.v])
         )
-
+ 
         # Submit via execTransaction
         tx = safe.functions.execTransaction(
             Web3.to_checksum_address(CTF_ADDRESS),
@@ -783,140 +832,145 @@ def _redeem_position_sync(condition_id: str) -> bool:
             "gas":      300_000,
             "gasPrice": w3.eth.gas_price,
         })
-
+ 
         signed_tx = account.sign_transaction(tx)
         tx_hash_sent = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash_sent, timeout=60)
         return receipt.status == 1
-
+ 
     except Exception as exc:
         print(f"[Redeem] on-chain error: {exc}")
         return False
-
-
+ 
+ 
 async def auto_redeem_monitor(session: aiohttp.ClientSession) -> None:
     """
-    Every REDEEM_INTERVAL seconds, fetch closed positions from the Data API
-    and redeem any that have resolved with a non-zero payout.
-    A position is redeemable if its current value > 0 AND the market is closed.
+    Checks every REDEEM_INTERVAL seconds for resolved positions with value > 0.
+    Sends a Discord alert so you can redeem manually at polymarket.com.
+ 
+    Note: Programmatic redemption is not possible for email/Magic proxy wallets
+    without the Polymarket Builder Relayer program. This monitor alerts you so
+    you never miss a winning position.
     """
-    # Give the bot time to start up before first check
     await asyncio.sleep(30)
-
+    notified: set[str] = set()  # avoid re-alerting the same position
+ 
     while True:
         try:
             if not FUNDER_ADDRESS:
                 await asyncio.sleep(REDEEM_INTERVAL)
                 continue
-
+ 
             async with session.get(
                 "https://data-api.polymarket.com/positions",
-                params={"user": FUNDER_ADDRESS, "sizeThreshold": 0.01,
-                        "limit": 500, "redeemable": "true"},
+                params={"user": FUNDER_ADDRESS, "sizeThreshold": 0.01, "limit": 500},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 resp.raise_for_status()
                 positions = await resp.json()
-
+ 
             redeemable = [
                 p for p in positions
-                if float(p.get("currentValue", 0)) > 0
-                and p.get("redeemable", False)
+                if p.get("redeemable", False)
+                and float(p.get("currentValue", 0)) > 0
+                and p.get("asset", "") not in notified
             ]
-
-            if not redeemable:
-                await asyncio.sleep(REDEEM_INTERVAL)
-                continue
-
-            print(f"[Redeem] {len(redeemable)} redeemable position(s) found.")
-
-            for pos in redeemable:
-                condition_id = pos.get("conditionId") or pos.get("market", "")
-                token_id     = pos.get("asset", "")
-                value        = float(pos.get("currentValue", 0))
-                title        = pos.get("title", token_id[:20])
-
-                print(f"  [Redeem] {title[:50]} — value ${value:.2f}  conditionId={condition_id[:16]}…")
-
-                success = await run_blocking(_redeem_position_sync, condition_id)
-
-                if success:
-                    print(f"  [Redeem] ✓ Redeemed ${value:.2f}")
-                    await send_discord(session,
-                        f"**Market:** {title}"
-                        f"**Redeemed:** ${value:.2f} USDC returned to wallet",
-                        color=0x57F287, title="✅ Position Redeemed"
-                    )
-                    # Clear from local position tracking
-                    await record_position(token_id, -999, 0)
-                else:
-                    print(f"  [Redeem] ✗ Failed — may need manual redemption on Polymarket")
-                    await send_discord(session,
-                        f"**Market:** {title}"
-                        f"**Value:** ${value:.2f}"
-                        f"Auto-redeem failed — please redeem manually at polymarket.com",
-                        color=0xFEE75C, title="⚠️ Redeem Failed — Manual Action Needed"
-                    )
-
+ 
+            if redeemable:
+                total = sum(float(p.get("currentValue", 0)) for p in redeemable)
+                lines = "\n".join(
+                    f"• {p.get('title', p.get('asset','?'))[:50]} — **${float(p.get('currentValue', 0)):.2f}**"
+                    for p in redeemable
+                )
+                print(f"[Redeem] {len(redeemable)} position(s) ready — ${total:.2f} total")
+                await send_discord(session,
+                    f"**{len(redeemable)} position(s) ready to redeem** — total **${total:.2f}**\n\n"
+                    f"{lines}\n\n"
+                    f"➡️ Go to **polymarket.com/portfolio** to redeem and return USDC to your wallet.",
+                    color=0x57F287,
+                    title="💰 Positions Ready to Redeem"
+                )
+                for p in redeemable:
+                    notified.add(p.get("asset", ""))
+ 
         except Exception as exc:
             print(f"[Redeem] Monitor error: {exc}")
-
+ 
         await asyncio.sleep(REDEEM_INTERVAL)
-
-
+ 
+ 
 # ── Stop-loss monitor ──────────────────────────────────────────────────────────
-
+ 
 async def stop_loss_monitor(session: aiohttp.ClientSession) -> None:
+    """
+    Trailing stop: tracks peak price and triggers when price drops
+    STOP_LOSS_PCT% from the peak — protects gains, not just entry.
+    """
     while True:
         await asyncio.sleep(STOP_LOSS_INTERVAL)
         positions = get_all_positions()
         if not positions:
             continue
-
+ 
         for pos in positions:
             token_id = pos["token_id"]
             shares   = pos["shares"]
             entry    = pos["entry_price"]
+            peak     = pos.get("peak_price", entry)
             if entry <= 0:
                 continue
-
+ 
             current = get_live_best_bid(token_id)
             if current is None:
                 current = await run_blocking(_rest_best_bid, token_id)
             if current is None:
                 continue
-
-            pnl_pct = (current - entry) / entry
-            if pnl_pct > -STOP_LOSS_PCT:
+ 
+            # Update peak if new high
+            if current > peak:
+                await update_peak_price(token_id, current)
+                peak = current
+ 
+            # Trailing: measure drop from peak (or entry if peak not set)
+            reference = peak if peak > 0 else entry
+            drop_pct  = (reference - current) / reference
+ 
+            if drop_pct <= STOP_LOSS_PCT:
                 continue
-
+ 
             market   = _market_cache.get(token_id, {})
             question = market.get("question", token_id[:20])
-
-            print(f"[StopLoss] {question[:40]} — PNL {pnl_pct*100:.1f}% — SELL")
-            await discord_stop_loss(session, token_id, question, shares, entry, current, pnl_pct)
-
+            gain_pct = (peak - entry) / entry * 100 if entry > 0 else 0
+ 
+            print(f"[TrailingStop] {question[:40]} — entry ${entry:.2f} peak ${peak:.2f} now ${current:.2f} drop {drop_pct*100:.1f}%")
+            await send_discord(session,
+                f"**Market:** {question}\n"
+                f"**Shares:** {shares:.0f} | **Entry:** ${entry:.4f} | **Peak:** ${peak:.4f} | **Now:** ${current:.4f}\n"
+                f"**Peak gain:** +{gain_pct:.1f}% | **Drop from peak:** -{drop_pct*100:.1f}%\n"
+                f"Trailing stop triggered at -{STOP_LOSS_PCT*100:.0f}% from peak",
+                color=0xFF6B35, title="🔻 Trailing Stop Triggered"
+            )
+ 
             if not DRY_RUN:
                 try:
-                    # FIX: price rounded to 2dp, size to 4dp
                     order = OrderArgs(
                         token_id=token_id,
                         price=round(current, 2),
-                        size=int(shares * 10) / 10,  # truncate to 1dp
+                        size=float(max(1, int(shares))),
                         side="SELL"
                     )
                     signed = await run_blocking(client.create_order, order)
                     await run_blocking(client.post_order, signed, OrderType.FAK)
                     await record_position(token_id, -shares, current)
                 except Exception as exc:
-                    await discord_error(session, f"stop_loss SELL {token_id}", exc)
+                    await discord_error(session, f"trailing stop SELL {token_id}", exc)
             else:
                 print(f"  [DRY RUN] Would SELL {shares} shares @ {current:.4f}")
                 await record_position(token_id, -shares, current)
-
-
+ 
+ 
 # ── Trade execution ────────────────────────────────────────────────────────────
-
+ 
 async def execute_trade(
     session: aiohttp.ClientSession, token_id: str, side: str,
     our_size: float, reference_price: float, positions: dict[str, float],
@@ -939,7 +993,7 @@ async def execute_trade(
                     OrderArgs(token_id=token_id, price=price, size=shares, side="BUY"))
                 await run_blocking(client.post_order, signed, OrderType.FAK)
             await record_position(token_id, +shares, price)
-
+ 
         elif side == "SELL":
             # Check both live API positions and local DB
             held = positions.get(token_id, 0.0)
@@ -966,73 +1020,71 @@ async def execute_trade(
                     OrderArgs(token_id=token_id, price=price, size=shares, side="SELL"))
                 await run_blocking(client.post_order, signed, OrderType.FAK)
             await record_position(token_id, -shares, price)
-
+ 
         else:
             return False, f"unknown side '{side}'"
-
+ 
         return True, ""
-
+ 
     except Exception as exc:
         return False, str(exc)
-
-
+ 
+ 
 # ── Per-target scan ────────────────────────────────────────────────────────────
-
+ 
 async def scan_target(
     session: aiohttp.ClientSession, target: dict, positions: dict[str, float],
 ) -> None:
     address  = target["address"]
     label    = target["label"]
     copy_pct = target.get("copy_pct", COPY_PERCENT)
-
+ 
     try:
         activities = await get_activity(session, address, limit=20)
     except Exception as exc:
         print(f"  [{label}] Activity fetch failed: {exc}")
         await discord_error(session, f"get_activity() for {label}", exc)
         return
-
+ 
     new_trades = []
     for a in activities:
         if a.get("type") != "TRADE":
             continue
         if not await is_seen(address, a.get("id") or _trade_fingerprint(a)):
             new_trades.append(a)
-
+ 
     if not new_trades:
         return
-
+ 
     print(f"  [{label}] {len(new_trades)} new trade(s).")
-
+ 
     for act in new_trades:
         trade_id      = act.get("id") or _trade_fingerprint(act)
         await mark_seen(address, trade_id)
-
+ 
         token_id      = act.get("asset")
         side          = act.get("side", "").upper()
         trade_price   = float(act.get("price", 0))
         shares_traded = float(act.get("size", 0))
         trade_usd     = round(shares_traded * trade_price, 2)
-
-        await subscribe_token(token_id)
-
+ 
         try:
             market = await get_market(session, token_id)
         except Exception as exc:
             market = {}
             await discord_error(session, f"get_market({token_id})", exc)
-
+ 
         if market.get("closed", False) or not market.get("acceptingOrders", True):
             print(f"    [skip] market closed")
             continue
-
+ 
         question   = market.get("question", token_id)
         market_url = get_market_url(market)
-
+ 
         if trade_price <= 0:
             print(f"    [skip] price zero")
             continue
-
+ 
         # ── Opposite-side guard ────────────────────────────────────────────
         # Check if we already hold the opposite outcome of this market.
         # YES and NO share the same conditionId. If we hold YES and the target
@@ -1052,7 +1104,7 @@ async def scan_target(
                 continue
         except Exception:
             pass  # if we can't parse tokens, proceed normally
-
+ 
         # Spread filter — only apply when WS book is live (spread > 0 means real data)
         spread = get_live_spread(token_id)
         if spread is not None and spread > 0 and spread > MAX_SPREAD:
@@ -1062,7 +1114,7 @@ async def scan_target(
             await discord_trade_alert(session, act, label, address, question, market_url,
                                       0, "—", False, reason=reason)
             continue
-
+ 
         # Conviction filter — evaluated BEFORE recording this trade in history
         high_conviction, conviction_note = is_high_conviction(address, trade_usd)
         if not high_conviction:
@@ -1072,16 +1124,23 @@ async def scan_target(
                                       0, "—", False, conviction_note=conviction_note,
                                       reason=conviction_note)
             continue
-
+ 
         # Record AFTER check so this trade isn't in its own baseline
         record_trade_size(address, trade_usd)
-
-        our_size, sizing_note = await compute_trade_size(token_id, shares_traded, trade_price, copy_pct)
-
+ 
+        # Pass all token IDs for this market so cap accounts for existing positions
+        try:
+            _tids_raw = market.get("clobTokenIds", "[]")
+            import json as _j
+            _all_tids = _j.loads(_tids_raw) if isinstance(_tids_raw, str) else _tids_raw
+        except Exception:
+            _all_tids = [token_id]
+        our_size, sizing_note = await compute_trade_size(token_id, shares_traded, trade_price, copy_pct, _all_tids)
+ 
         if our_size <= 0 and "balance" in sizing_note:
             await discord_error(session, "Zero balance", Exception(sizing_note))
             continue
-
+ 
         if our_size < MIN_TRADE_SIZE:
             reason = f"${our_size:.2f} below minimum ${MIN_TRADE_SIZE:.2f}"
             print(f"    [skip] {reason}")
@@ -1089,7 +1148,10 @@ async def scan_target(
             await discord_trade_alert(session, act, label, address, question, market_url,
                                       our_size, sizing_note, False, conviction_note, reason)
             continue
-
+ 
+        # Subscribe to live order book only now — after all filters passed
+        await subscribe_token(token_id)
+ 
         if DRY_RUN:
             executed, reason = True, ""
             book_src = "WS" if get_live_best_ask(token_id) else "pending"
@@ -1099,18 +1161,18 @@ async def scan_target(
                 session, token_id, side, our_size, trade_price, positions)
             if executed:
                 add_cycle_exposure(token_id, our_size)
-
+ 
         await log_trade(address, label, token_id, question, side, our_size, trade_price, executed, reason)
         await discord_trade_alert(session, act, label, address, question, market_url,
                                   our_size, sizing_note, executed, conviction_note, reason)
-
+ 
         mark = "~" if DRY_RUN else ("✓" if executed else "✗")
         print(f"    [{mark}] {side} ${our_size:.2f}  '{question[:45]}'"
               + (f"  — {reason}" if reason else ""))
-
-
+ 
+ 
 # ── Seed + main ────────────────────────────────────────────────────────────────
-
+ 
 async def seed_seen_trades(session: aiohttp.ClientSession, targets: list[dict]) -> None:
     for t in targets:
         try:
@@ -1124,8 +1186,8 @@ async def seed_seen_trades(session: aiohttp.ClientSession, targets: list[dict]) 
             print(f"[Init] {t['label']} — seeded {count} trade(s).")
         except Exception as exc:
             print(f"[Init] Could not seed {t['label']}: {exc}")
-
-
+ 
+ 
 async def main() -> None:
     async with aiohttp.ClientSession() as session:
         print("=" * 62)
@@ -1139,10 +1201,10 @@ async def main() -> None:
         print(f"  Slippage      : {SLIPPAGE_TOLERANCE*100:.0f}%  |  Min size: ${MIN_TRADE_SIZE:.2f}")
         print(f"  Order type    : FAK  |  Poll: {POLL_INTERVAL}s")
         print("=" * 62)
-
+ 
         targets = await get_active_targets(session)
         await seed_seen_trades(session, targets)
-
+ 
         target_lines = "\n".join(
             f"• **{t['label']}** `{t['address'][:8]}...`  ({t.get('copy_pct', COPY_PERCENT)*100:.0f}%)"
             for t in targets
@@ -1155,20 +1217,20 @@ async def main() -> None:
             color=0x5865F2 if DRY_RUN else 0xED4245,
             title="Dry Run Started" if DRY_RUN else "Live Bot Started",
         )
-
+ 
         ws_task        = asyncio.create_task(ws_book_listener())
         stop_loss_task = asyncio.create_task(stop_loss_monitor(session))
         redeem_task    = asyncio.create_task(auto_redeem_monitor(session))
         cycle          = 0
-
+ 
         while True:
             cycle += 1
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [{'DRY RUN' if DRY_RUN else 'LIVE'}] cycle {cycle}")
-
+ 
             reset_cycle_exposure()
             targets   = await get_active_targets(session)
             positions = await get_my_positions(session)
-
+ 
             results = await asyncio.gather(
                 *[scan_target(session, t, positions) for t in targets],
                 return_exceptions=True,
@@ -1178,19 +1240,19 @@ async def main() -> None:
                     lbl = targets[i]["label"] if i < len(targets) else f"target[{i}]"
                     print(f"  [{lbl}] CRASH: {result}")
                     await discord_error(session, f"scan_target {lbl}", result)
-
+ 
             if cycle % 30 == 0:
                 await discord_stats(session, targets)
-
+ 
             if ws_task.done():
                 ws_task = asyncio.create_task(ws_book_listener())
             if stop_loss_task.done():
                 stop_loss_task = asyncio.create_task(stop_loss_monitor(session))
             if redeem_task.done():
                 redeem_task = asyncio.create_task(auto_redeem_monitor(session))
-
+ 
             await asyncio.sleep(POLL_INTERVAL)
-
-
+ 
+ 
 if __name__ == "__main__":
     asyncio.run(main())
