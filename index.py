@@ -1,3 +1,4 @@
+
 """
 Polymarket Copy-Trade Bot
 """
@@ -57,6 +58,17 @@ MAX_SEEN_IDS       = 1000
 BALANCE_TTL        = 30
 WS_PING_INTERVAL   = 10
 STOP_LOSS_INTERVAL = 60
+ 
+# Smart polling — faster during active hours, slower overnight
+POLL_INTERVAL_ACTIVE  = 5    # seconds during US sports prime time
+POLL_INTERVAL_QUIET   = 30   # seconds overnight
+ 
+# Target quality: skip wallets with volume below this threshold
+# High PNL on low volume = lucky one-off bet, not consistent edge
+MIN_TARGET_VOLUME = 1000  # minimum $1000 traded volume this month
+ 
+# Reconcile positions DB against live API every N cycles
+POSITIONS_RECONCILE_CYCLES = 60
 DRY_RUN            = False
  
 DB_PATH = "bot_state.db"
@@ -137,6 +149,12 @@ def init_db() -> sqlite3.Connection:
             total_copied  INTEGER NOT NULL DEFAULT 0,
             total_skipped INTEGER NOT NULL DEFAULT 0,
             last_seen     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS notified_redeems (
+            asset_id TEXT PRIMARY KEY,
+            ts       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
         )
     """)
     con.commit()
@@ -378,14 +396,22 @@ async def fetch_leaderboard_targets(session: aiohttp.ClientSession) -> list[dict
             addr = entry.get("address") or entry.get("proxyWallet")
             if not addr:
                 continue
-            pnl = float(entry.get("pnl", 0))
+            pnl        = float(entry.get("pnl", 0))
+            
             if pnl <= 0:
-                continue
+                continue  # skip losing wallets
+ 
+            vol = float(entry.get("vol", 0))
+            if vol < MIN_TARGET_VOLUME:
+                print(f"[Targets] Skipping {addr[:8]}… — vol ${vol:.0f} below min ${MIN_TARGET_VOLUME}")
+                continue  # skip low-volume wallets (one-hit-wonders)
+ 
             targets.append({
                 "address":  addr,
-                "label":    entry.get("name") or f"{addr[:8]}…",
+                "label":    entry.get("userName") or f"{addr[:8]}…",
                 "copy_pct": COPY_PERCENT,
                 "pnl":      pnl,
+                "vol":      vol,
             })
             if len(targets) >= DYNAMIC_TARGET_COUNT:
                 break
@@ -401,6 +427,21 @@ async def fetch_leaderboard_targets(session: aiohttp.ClientSession) -> list[dict
     return TARGET_WALLETS
  
  
+def get_pinned_targets() -> list[dict]:
+    """
+    Return wallets we've copied that we still hold open positions from.
+    Prevents rotation from dropping a wallet mid-position.
+    """
+    rows = db.execute("""
+        SELECT DISTINCT tl.target_addr, tl.target_label
+        FROM trade_log tl
+        JOIN positions p ON tl.token_id = p.token_id
+        WHERE tl.executed = 1 AND p.shares > 0.001
+    """).fetchall()
+    return [{"address": r[0], "label": r[1], "copy_pct": COPY_PERCENT, "pinned": True}
+            for r in rows]
+
+
 async def get_active_targets(session: aiohttp.ClientSession) -> list[dict]:
     global _dynamic_targets, _dynamic_cycle_count
     if not DYNAMIC_TARGETS:
@@ -408,7 +449,14 @@ async def get_active_targets(session: aiohttp.ClientSession) -> list[dict]:
     _dynamic_cycle_count += 1
     if not _dynamic_targets or _dynamic_cycle_count % DYNAMIC_ROTATE_EVERY == 0:
         _dynamic_targets = await fetch_leaderboard_targets(session)
-    return _dynamic_targets
+
+    # Re-add any wallets rotated out that still have open copied positions
+    current_addrs = {t["address"] for t in _dynamic_targets}
+    pinned = [t for t in get_pinned_targets() if t["address"] not in current_addrs]
+    if pinned:
+        for t in pinned:
+            print(f"[Targets] Pinned {t['label']} ({t['address'][:8]}…) — open position held.")
+    return _dynamic_targets + pinned
  
  
 # ── Conviction filter ──────────────────────────────────────────────────────────
@@ -853,13 +901,18 @@ async def auto_redeem_monitor(session: aiohttp.ClientSession) -> None:
     you never miss a winning position.
     """
     await asyncio.sleep(30)
-    notified: set[str] = set()  # avoid re-alerting the same position
  
     while True:
         try:
             if not FUNDER_ADDRESS:
                 await asyncio.sleep(REDEEM_INTERVAL)
                 continue
+ 
+            # Load persisted notified set from DB (survives restarts)
+            async with _db_lock:
+                already_notified = {
+                    r[0] for r in db.execute("SELECT asset_id FROM notified_redeems").fetchall()
+                }
  
             async with session.get(
                 "https://data-api.polymarket.com/positions",
@@ -873,7 +926,7 @@ async def auto_redeem_monitor(session: aiohttp.ClientSession) -> None:
                 p for p in positions
                 if p.get("redeemable", False)
                 and float(p.get("currentValue", 0)) > 0
-                and p.get("asset", "") not in notified
+                and p.get("asset", "") not in already_notified
             ]
  
             if redeemable:
@@ -886,12 +939,18 @@ async def auto_redeem_monitor(session: aiohttp.ClientSession) -> None:
                 await send_discord(session,
                     f"**{len(redeemable)} position(s) ready to redeem** — total **${total:.2f}**\n\n"
                     f"{lines}\n\n"
-                    f"➡️ Go to **polymarket.com/portfolio** to redeem and return USDC to your wallet.",
+                    f"➡️ Go to **polymarket.com/portfolio** to redeem.",
                     color=0x57F287,
                     title="💰 Positions Ready to Redeem"
                 )
-                for p in redeemable:
-                    notified.add(p.get("asset", ""))
+                # Persist to DB so restarts don't re-alert
+                async with _db_lock:
+                    for p in redeemable:
+                        db.execute(
+                            "INSERT OR IGNORE INTO notified_redeems (asset_id) VALUES (?)",
+                            (p.get("asset", ""),)
+                        )
+                    db.commit()
  
         except Exception as exc:
             print(f"[Redeem] Monitor error: {exc}")
@@ -953,15 +1012,33 @@ async def stop_loss_monitor(session: aiohttp.ClientSession) -> None:
  
             if not DRY_RUN:
                 try:
+                    # Fetch live share count from Polymarket API to avoid
+                    # selling more than we actually hold (DB can drift)
+                    live_positions = await get_my_positions(session)
+                    live_shares = live_positions.get(token_id, 0.0)
+ 
+                    if live_shares <= 0:
+                        print(f"  [TrailingStop] No live position found — clearing DB entry")
+                        await record_position(token_id, -shares, current)
+                        continue
+ 
+                    # Use live share count, not DB count
+                    # For sells: use exact share count (no minimum).
+                    # int() truncates to whole shares to avoid decimal errors.
+                    # Do NOT enforce max(1,...) — we might hold less than 1 share.
+                    sell_size = float(int(live_shares))
+                    if sell_size <= 0:
+                        # Fractional share under 1 — sell the fraction as-is
+                        sell_size = round(live_shares, 4)
                     order = OrderArgs(
                         token_id=token_id,
                         price=round(current, 2),
-                        size=float(max(1, int(shares))),
+                        size=sell_size,
                         side="SELL"
                     )
                     signed = await run_blocking(client.create_order, order)
                     await run_blocking(client.post_order, signed, OrderType.FAK)
-                    await record_position(token_id, -shares, current)
+                    await record_position(token_id, -live_shares, current)
                 except Exception as exc:
                     await discord_error(session, f"trailing stop SELL {token_id}", exc)
             else:
@@ -1173,6 +1250,76 @@ async def scan_target(
  
 # ── Seed + main ────────────────────────────────────────────────────────────────
  
+ 
+ 
+ 
+ 
+async def reconcile_positions(session: aiohttp.ClientSession) -> None:
+    """
+    Sync the local positions SQLite table against the live Polymarket API.
+    Replaces whatever is in the DB with what Polymarket actually says you hold.
+    Prevents ghost stop-losses and missed sells caused by DB drift from
+    manual trades, partial fills, or bot restarts.
+    """
+    if not FUNDER_ADDRESS:
+        return
+    try:
+        live = await get_my_positions(session)
+        if not live and not DRY_RUN:
+            return  # empty response — don't wipe local state on API error
+ 
+        async with _db_lock:
+            # Get all token_ids currently tracked locally
+            local_rows = db.execute(
+                "SELECT token_id, shares, entry_price, peak_price FROM positions WHERE shares > 0.001"
+            ).fetchall()
+            local = {r[0]: {"shares": r[1], "entry": r[2], "peak": r[3]} for r in local_rows}
+ 
+            synced = 0
+            removed = 0
+ 
+            # Update or insert live positions
+            for token_id, live_shares in live.items():
+                loc = local.get(token_id)
+                entry = loc["entry"] if loc and loc["entry"] > 0 else 0.0
+                peak  = loc["peak"]  if loc else 0.0
+                db.execute("""INSERT INTO positions (token_id, shares, entry_price, peak_price, updated_at)
+                    VALUES (?,?,?,?,strftime('%s','now'))
+                    ON CONFLICT(token_id) DO UPDATE SET
+                        shares=excluded.shares,
+                        updated_at=excluded.updated_at""",
+                    (token_id, live_shares, entry, peak))
+                synced += 1
+ 
+            # Zero out positions we hold locally but Polymarket says we don't
+            for token_id in local:
+                if token_id not in live:
+                    db.execute(
+                        "UPDATE positions SET shares=0, updated_at=strftime('%s','now') WHERE token_id=?",
+                        (token_id,)
+                    )
+                    removed += 1
+ 
+            db.commit()
+ 
+        if synced or removed:
+            print(f"[Reconcile] Synced {synced} position(s), removed {removed} stale position(s).")
+ 
+    except Exception as exc:
+        print(f"[Reconcile] Failed: {exc}")
+ 
+def get_poll_interval() -> int:
+    """
+    Return a shorter poll interval during US sports prime time
+    (6pm-midnight ET = 22:00-05:00 UTC) and longer overnight.
+    Most NBA/NHL games tip off between 7-10pm ET.
+    """
+    utc_hour = datetime.utcnow().hour
+    # Active window: 22:00 UTC to 05:00 UTC (6pm-midnight ET)
+    if utc_hour >= 22 or utc_hour < 5:
+        return POLL_INTERVAL_ACTIVE
+    return POLL_INTERVAL_QUIET
+ 
 async def seed_seen_trades(session: aiohttp.ClientSession, targets: list[dict]) -> None:
     for t in targets:
         try:
@@ -1204,6 +1351,7 @@ async def main() -> None:
  
         targets = await get_active_targets(session)
         await seed_seen_trades(session, targets)
+        await reconcile_positions(session)  # sync positions DB on startup
  
         target_lines = "\n".join(
             f"• **{t['label']}** `{t['address'][:8]}...`  ({t.get('copy_pct', COPY_PERCENT)*100:.0f}%)"
@@ -1241,6 +1389,9 @@ async def main() -> None:
                     print(f"  [{lbl}] CRASH: {result}")
                     await discord_error(session, f"scan_target {lbl}", result)
  
+            if cycle % POSITIONS_RECONCILE_CYCLES == 0:
+                await reconcile_positions(session)
+ 
             if cycle % 30 == 0:
                 await discord_stats(session, targets)
  
@@ -1251,7 +1402,9 @@ async def main() -> None:
             if redeem_task.done():
                 redeem_task = asyncio.create_task(auto_redeem_monitor(session))
  
-            await asyncio.sleep(POLL_INTERVAL)
+            # Smart poll: faster during US sports prime time, slower overnight
+            interval = get_poll_interval()
+            await asyncio.sleep(interval)
  
  
 if __name__ == "__main__":
