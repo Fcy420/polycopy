@@ -44,9 +44,9 @@ MAX_MARKET_PERCENT = 0.15
 MIN_TRADE_SIZE     = 0.20
 SLIPPAGE_TOLERANCE = 0.05
 MAX_SPREAD         = 0.12
-STOP_LOSS_PCT      = 0.25
+STOP_LOSS_PCT      = 0.80
  
-CONVICTION_MULTIPLIER = 0
+CONVICTION_MULTIPLIER = 1.5
 CONVICTION_LOOKBACK   = 20
  
 DYNAMIC_TARGETS      = True
@@ -469,6 +469,31 @@ def record_trade_size(address: str, size_usd: float) -> None:
     history.append(size_usd)
     if len(history) > CONVICTION_LOOKBACK:
         history.pop(0)
+
+
+def seed_conviction_history() -> None:
+    """
+    Pre-populate _trade_size_history from trade_log on startup.
+    Without this, the first few trades after a restart set an arbitrary
+    baseline and rejected trades never enter history (one-way ratchet).
+    """
+    rows = db.execute("""
+        SELECT target_addr, our_size
+        FROM trade_log
+        WHERE our_size > 0
+        ORDER BY ts DESC
+        LIMIT ?
+    """, (CONVICTION_LOOKBACK * 20,)).fetchall()
+
+    # Replay oldest-first so history ends up in chronological order
+    for addr, size in reversed(rows):
+        history = _trade_size_history[addr]
+        history.append(size)
+        if len(history) > CONVICTION_LOOKBACK:
+            history.pop(0)
+
+    seeded = sum(len(v) for v in _trade_size_history.values())
+    print(f"[Init] Conviction history seeded — {seeded} trade(s) across {len(_trade_size_history)} wallet(s).")
  
  
 def is_high_conviction(address: str, size_usd: float) -> tuple[bool, str]:
@@ -1192,7 +1217,9 @@ async def scan_target(
                                       0, "—", False, reason=reason)
             continue
  
-        # Conviction filter — evaluated BEFORE recording this trade in history
+        # Conviction filter — record ALL sizes (pass or fail) so the baseline
+        # reflects the whale's true behaviour and doesn't ratchet upward.
+        record_trade_size(address, trade_usd)
         high_conviction, conviction_note = is_high_conviction(address, trade_usd)
         if not high_conviction:
             print(f"    [skip] {conviction_note}")
@@ -1201,9 +1228,6 @@ async def scan_target(
                                       0, "—", False, conviction_note=conviction_note,
                                       reason=conviction_note)
             continue
- 
-        # Record AFTER check so this trade isn't in its own baseline
-        record_trade_size(address, trade_usd)
  
         # Pass all token IDs for this market so cap accounts for existing positions
         try:
@@ -1349,6 +1373,7 @@ async def main() -> None:
         print(f"  Order type    : FAK  |  Poll: {POLL_INTERVAL}s")
         print("=" * 62)
  
+        seed_conviction_history()           # restore trade size baselines from DB
         targets = await get_active_targets(session)
         await seed_seen_trades(session, targets)
         await reconcile_positions(session)  # sync positions DB on startup
