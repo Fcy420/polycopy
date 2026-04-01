@@ -48,6 +48,9 @@ STOP_LOSS_PCT      = 0.80
  
 CONVICTION_MULTIPLIER = 1.5
 CONVICTION_LOOKBACK   = 20
+
+PRICE_LAG_MAX        = 0.15   # skip BUY if current ask is >15% above whale's price
+WIN_RATE_CHECK_INTERVAL = 300  # check resolved markets every 5 minutes
  
 DYNAMIC_TARGETS      = True
 DYNAMIC_TARGET_COUNT = 10
@@ -97,15 +100,18 @@ def init_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.execute("PRAGMA journal_mode=WAL")
  
-    # Migration: safely add entry_price if missing from an older DB
-    for col, definition in [
-        ("entry_price", "REAL NOT NULL DEFAULT 0"),
-        ("peak_price",  "REAL NOT NULL DEFAULT 0"),
+    # Migrations: safely add columns to existing tables
+    for table, col, definition in [
+        ("positions",    "entry_price", "REAL NOT NULL DEFAULT 0"),
+        ("positions",    "peak_price",  "REAL NOT NULL DEFAULT 0"),
+        ("trade_log",    "outcome",     "TEXT NOT NULL DEFAULT ''"),
+        ("target_stats", "wins",        "INTEGER NOT NULL DEFAULT 0"),
+        ("target_stats", "losses",      "INTEGER NOT NULL DEFAULT 0"),
     ]:
         try:
-            con.execute(f"ALTER TABLE positions ADD COLUMN {col} {definition}")
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
             con.commit()
-            print(f"[DB] Migrated: added {col} column.")
+            print(f"[DB] Migrated: added {table}.{col}.")
         except Exception:
             pass  # already exists
  
@@ -157,6 +163,14 @@ def init_db() -> sqlite3.Connection:
             ts       INTEGER NOT NULL DEFAULT (strftime('%s','now'))
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS resolution_checks (
+            trade_log_id INTEGER PRIMARY KEY,
+            outcome      TEXT NOT NULL,
+            won          INTEGER NOT NULL,
+            ts           INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        )
+    """)
     con.commit()
     return con
  
@@ -184,14 +198,14 @@ async def mark_seen(address: str, trade_id: str) -> None:
  
 async def log_trade(
     target_addr, target_label, token_id, market_q,
-    side, our_size, price, executed, reason,
+    side, our_size, price, executed, reason, outcome="",
 ) -> None:
     async with _db_lock:
         db.execute("""INSERT INTO trade_log
-            (target_addr,target_label,token_id,market_q,side,our_size,price,executed,reason,dry_run)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (target_addr,target_label,token_id,market_q,side,our_size,price,executed,reason,dry_run,outcome)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (target_addr, target_label, token_id, market_q, side,
-             our_size, price, int(executed), reason, int(DRY_RUN)))
+             our_size, price, int(executed), reason, int(DRY_RUN), outcome))
         if executed:
             db.execute("""INSERT INTO target_stats (address,label,total_copied,total_skipped,last_seen)
                 VALUES (?,?,1,0,strftime('%s','now'))
@@ -276,9 +290,10 @@ def get_market_invested(token_ids: list[str]) -> float:
  
 def get_target_stats() -> list[dict]:
     rows = db.execute(
-        "SELECT address, label, total_copied, total_skipped FROM target_stats"
+        "SELECT address, label, total_copied, total_skipped, wins, losses FROM target_stats"
     ).fetchall()
-    return [{"address": r[0], "label": r[1], "copied": r[2], "skipped": r[3]} for r in rows]
+    return [{"address": r[0], "label": r[1], "copied": r[2], "skipped": r[3],
+             "wins": r[4], "losses": r[5]} for r in rows]
  
  
 # ── Live order book ────────────────────────────────────────────────────────────
@@ -740,9 +755,11 @@ async def discord_stats(session, targets) -> None:
         return
     lines = ["**Per-target performance:**\n"]
     for s in stats:
-        total = s["copied"] + s["skipped"]
-        hit   = f"{s['copied']/total*100:.0f}%" if total else "—"
-        lines.append(f"• **{s['label']}** — {s['copied']} copied, {s['skipped']} skipped ({hit})")
+        total    = s["copied"] + s["skipped"]
+        copy_hit = f"{s['copied']/total*100:.0f}%" if total else "—"
+        resolved = s["wins"] + s["losses"]
+        win_rate = f"{s['wins']/resolved*100:.0f}% W/R ({s['wins']}W/{s['losses']}L)" if resolved else "no resolved trades yet"
+        lines.append(f"• **{s['label']}** — {s['copied']} copied ({copy_hit}) | {win_rate}")
     await send_discord(session, "\n".join(lines), color=0x5865F2, title="Stats")
  
  
@@ -1169,6 +1186,7 @@ async def scan_target(
         trade_price   = float(act.get("price", 0))
         shares_traded = float(act.get("size", 0))
         trade_usd     = round(shares_traded * trade_price, 2)
+        outcome       = act.get("outcome", "")
  
         try:
             market = await get_market(session, token_id)
@@ -1186,7 +1204,21 @@ async def scan_target(
         if trade_price <= 0:
             print(f"    [skip] price zero")
             continue
- 
+
+        # ── Price lag filter ───────────────────────────────────────────────
+        # Skip BUY if price has moved too far since the whale entered.
+        if side == "BUY" and PRICE_LAG_MAX > 0:
+            current_ask = get_live_best_ask(token_id) or await run_blocking(_rest_best_ask, token_id)
+            if current_ask is not None:
+                lag_pct = (current_ask - trade_price) / trade_price
+                if lag_pct > PRICE_LAG_MAX:
+                    reason = f"price lag {lag_pct*100:.1f}% (whale ${trade_price:.3f} → now ${current_ask:.3f})"
+                    print(f"    [skip] {reason}")
+                    await log_trade(address, label, token_id, question, side, 0, trade_price, False, reason, outcome)
+                    await discord_trade_alert(session, act, label, address, question, market_url,
+                                              0, "—", False, reason=reason)
+                    continue
+
         # ── Opposite-side guard ────────────────────────────────────────────
         # Check if we already hold the opposite outcome of this market.
         # YES and NO share the same conditionId. If we hold YES and the target
@@ -1245,7 +1277,7 @@ async def scan_target(
         if our_size < MIN_TRADE_SIZE:
             reason = f"${our_size:.2f} below minimum ${MIN_TRADE_SIZE:.2f}"
             print(f"    [skip] {reason}")
-            await log_trade(address, label, token_id, question, side, our_size, trade_price, False, reason)
+            await log_trade(address, label, token_id, question, side, our_size, trade_price, False, reason, outcome)
             await discord_trade_alert(session, act, label, address, question, market_url,
                                       our_size, sizing_note, False, conviction_note, reason)
             continue
@@ -1263,7 +1295,7 @@ async def scan_target(
             if executed:
                 add_cycle_exposure(token_id, our_size)
  
-        await log_trade(address, label, token_id, question, side, our_size, trade_price, executed, reason)
+        await log_trade(address, label, token_id, question, side, our_size, trade_price, executed, reason, outcome)
         await discord_trade_alert(session, act, label, address, question, market_url,
                                   our_size, sizing_note, executed, conviction_note, reason)
  
@@ -1272,6 +1304,79 @@ async def scan_target(
               + (f"  — {reason}" if reason else ""))
  
  
+# ── Win rate monitor ──────────────────────────────────────────────────────────
+
+async def win_rate_monitor(session: aiohttp.ClientSession) -> None:
+    """
+    Periodically checks executed BUY trades against resolved markets and
+    updates wins/losses per target in target_stats.
+    Uses resolution_checks to avoid re-processing the same trade twice.
+    """
+    await asyncio.sleep(60)  # let the bot settle on startup
+
+    while True:
+        try:
+            # Fetch executed BUY trades not yet resolution-checked
+            rows = db.execute("""
+                SELECT tl.id, tl.target_addr, tl.token_id, tl.outcome
+                FROM trade_log tl
+                LEFT JOIN resolution_checks rc ON rc.trade_log_id = tl.id
+                WHERE tl.executed = 1 AND tl.side = 'BUY' AND tl.dry_run = 0
+                  AND rc.trade_log_id IS NULL
+            """).fetchall()
+
+            for row_id, target_addr, token_id, stored_outcome in rows:
+                try:
+                    market = await get_market(session, token_id)
+                    if not market:
+                        continue
+
+                    # Parse outcomePrices — ["1","0"] = YES won, ["0","1"] = NO won
+                    raw = market.get("outcomePrices", "[]")
+                    prices = json.loads(raw) if isinstance(raw, str) else raw
+                    if len(prices) < 2:
+                        continue
+                    yes_price = float(prices[0])
+                    no_price  = float(prices[1])
+
+                    # Only process fully resolved markets
+                    if yes_price not in (0.0, 1.0) or no_price not in (0.0, 1.0):
+                        continue
+
+                    winning_outcome = "Yes" if yes_price == 1.0 else "No"
+                    won = stored_outcome.lower() == winning_outcome.lower() if stored_outcome else None
+                    if won is None:
+                        continue
+
+                    async with _db_lock:
+                        db.execute(
+                            "INSERT OR IGNORE INTO resolution_checks (trade_log_id, outcome, won) VALUES (?,?,?)",
+                            (row_id, winning_outcome, int(won))
+                        )
+                        if won:
+                            db.execute(
+                                "UPDATE target_stats SET wins=wins+1 WHERE address=?",
+                                (target_addr,)
+                            )
+                        else:
+                            db.execute(
+                                "UPDATE target_stats SET losses=losses+1 WHERE address=?",
+                                (target_addr,)
+                            )
+                        db.commit()
+
+                    result = "WIN" if won else "LOSS"
+                    print(f"[WinRate] trade {row_id} resolved → {result} ({target_addr[:8]}…)")
+
+                except Exception as exc:
+                    print(f"[WinRate] Error checking trade {row_id}: {exc}")
+
+        except Exception as exc:
+            print(f"[WinRate] Monitor error: {exc}")
+
+        await asyncio.sleep(WIN_RATE_CHECK_INTERVAL)
+
+
 # ── Seed + main ────────────────────────────────────────────────────────────────
  
  
@@ -1394,6 +1499,7 @@ async def main() -> None:
         ws_task        = asyncio.create_task(ws_book_listener())
         stop_loss_task = asyncio.create_task(stop_loss_monitor(session))
         redeem_task    = asyncio.create_task(auto_redeem_monitor(session))
+        win_rate_task  = asyncio.create_task(win_rate_monitor(session))
         cycle          = 0
  
         while True:
@@ -1426,6 +1532,8 @@ async def main() -> None:
                 stop_loss_task = asyncio.create_task(stop_loss_monitor(session))
             if redeem_task.done():
                 redeem_task = asyncio.create_task(auto_redeem_monitor(session))
+            if win_rate_task.done():
+                win_rate_task = asyncio.create_task(win_rate_monitor(session))
  
             # Smart poll: faster during US sports prime time, slower overnight
             interval = get_poll_interval()
