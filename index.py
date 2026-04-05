@@ -24,8 +24,8 @@ load_dotenv()
  
 TARGET_WALLETS = [
     {
-        "address":  "0xd8f8c13644ea84d62e1ec88c5d1215e436eb0f11",
-        "label":    "Whale A",
+        "address":  "0x204f72f35326db932158cba6adff0b9a1da95e14",
+        "label":    "swisstony",
         "copy_pct": 0.2,
     },
 ]
@@ -39,20 +39,20 @@ WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID = POLYGON
  
 COPY_PERCENT       = 0.2
-MAX_WALLET_PERCENT = 0.30
+MAX_WALLET_PERCENT = 0.40
 MAX_MARKET_PERCENT = 0.15
 MIN_TRADE_SIZE     = 0.20
-SLIPPAGE_TOLERANCE = 0.05
+SLIPPAGE_TOLERANCE = 0.06
 MAX_SPREAD         = 0.12
-STOP_LOSS_PCT      = 0.80
+STOP_LOSS_PCT      = 0.90
  
-CONVICTION_MULTIPLIER = 1.5
+CONVICTION_MULTIPLIER = 0.0
 CONVICTION_LOOKBACK   = 20
 
 PRICE_LAG_MAX        = 0.15   # skip BUY if current ask is >15% above whale's price
 WIN_RATE_CHECK_INTERVAL = 300  # check resolved markets every 5 minutes
  
-DYNAMIC_TARGETS      = True
+DYNAMIC_TARGETS      = False
 DYNAMIC_TARGET_COUNT = 10
 DYNAMIC_ROTATE_EVERY = 30
  
