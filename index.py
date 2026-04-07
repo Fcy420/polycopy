@@ -1321,7 +1321,7 @@ async def win_rate_monitor(session: aiohttp.ClientSession) -> None:
                 SELECT tl.id, tl.target_addr, tl.token_id, tl.outcome
                 FROM trade_log tl
                 LEFT JOIN resolution_checks rc ON rc.trade_log_id = tl.id
-                WHERE tl.executed = 1 AND tl.side = 'BUY' AND tl.dry_run = 0
+                WHERE tl.executed = 1 AND tl.side = 'BUY'
                   AND rc.trade_log_id IS NULL
             """).fetchall()
 
